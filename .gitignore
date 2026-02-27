@@ -23,3 +23,20 @@ dist-ssr
 *.sln
 *.sw?
 .env
+
+# Data and model directories
+**/data/
+**/model/
+**/client_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Hardhat
+artifacts/
+cache/

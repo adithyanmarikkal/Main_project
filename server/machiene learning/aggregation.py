@@ -1,9 +1,21 @@
 import os
+import sys
 import glob
 import json
 import numpy as np
 import xgboost as xgb
 from collections import defaultdict
+
+# ── Blockchain connector (optional – graceful degradation if unavailable) ─────
+try:
+    _BLOCKCHAIN_DIR = os.path.join(os.path.dirname(__file__), "..", "Blockchain")
+    sys.path.insert(0, os.path.abspath(_BLOCKCHAIN_DIR))
+    from blockchain_connector import run_aggregation_round as _bc_run_round
+
+    BLOCKCHAIN_ENABLED = True
+except Exception as _bc_err:
+    BLOCKCHAIN_ENABLED = False
+    _bc_err_msg = str(_bc_err)
 
 
 def aggregate_histograms_fedavg(
@@ -270,7 +282,24 @@ def federated_averaging_aggregation(
             output_path=output_path,
         )
 
-        return global_model
+        # ── Upload to IPFS + register on Polygon Amoy ─────────────────────
+        new_cid = None
+        if BLOCKCHAIN_ENABLED:
+            try:
+                print(
+                    "\n🔗 Registering aggregated model on Polygon Amoy via blockchain connector..."
+                )
+                new_cid = _bc_run_round(output_path)
+            except Exception as bc_exc:
+                print(f"⚠️  Blockchain registration skipped: {bc_exc}")
+        else:
+            print(
+                f"⚠️  Blockchain connector unavailable – skipping on-chain registration."
+            )
+            if not BLOCKCHAIN_ENABLED:
+                print(f"   Reason: {_bc_err_msg}")
+
+        return global_model, new_cid
     else:
         # Fallback to simple model aggregation (not true federated learning)
         print("\n⚠️  Using simplified model aggregation (not true federated learning)")
@@ -291,7 +320,7 @@ def federated_averaging_aggregation(
         model.load_model(model_files[max_weight_idx])
         model.save_model(output_path)
 
-        return model
+        return model, None
 
 
 if __name__ == "__main__":
@@ -299,15 +328,25 @@ if __name__ == "__main__":
     print("🚀 FEDERATED LEARNING AGGREGATION SERVER")
     print("=" * 70)
 
+    if BLOCKCHAIN_ENABLED:
+        print("🔗 Blockchain connector: ENABLED (Polygon Amoy)")
+    else:
+        print(f"⚠️  Blockchain connector: DISABLED ({_bc_err_msg})")
+
     # TRUE FEDERATED LEARNING: Aggregate using histograms
     try:
-        global_model = federated_averaging_aggregation(
+        global_model, new_cid = federated_averaging_aggregation(
             model_folder="model",
             output_path="model/global_model.json",
             use_histograms=True,
         )
         print("\n✅ Federated aggregation complete!")
-        print("📊 Global model ready for distribution to clients")
+        if new_cid:
+            print(f"🔗 New global model CID (on-chain): {new_cid}")
+            print(f"   🌐 https://gateway.pinata.cloud/ipfs/{new_cid}")
+            print("📝 blockchain.txt updated with new CID")
+        else:
+            print("📊 Global model saved locally (on-chain registration skipped)")
     except FileNotFoundError as e:
         print(f"\n⚠️  {e}")
         print("\nℹ️  Make sure clients have computed and saved their histograms first.")

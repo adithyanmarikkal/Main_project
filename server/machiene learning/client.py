@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -7,6 +8,16 @@ import json
 import hashlib
 import argparse
 from datetime import datetime
+
+try:
+    import requests
+    from dotenv import load_dotenv
+
+    # Load .env from the server directory (one level up from this script)
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
+except ImportError:
+    requests = None
+    load_dotenv = None
 
 
 def get_client_id():
@@ -30,22 +41,118 @@ def get_client_id():
     return client_id
 
 
+# ── IPFS Gateways (tried in order) ──────────────────────────────────────────
+IPFS_GATEWAYS = [
+    "https://gateway.pinata.cloud/ipfs/{cid}",
+    "https://ipfs.io/ipfs/{cid}",
+    "https://cloudflare-ipfs.com/ipfs/{cid}",
+]
+
+
+def read_ipfs_hash_from_blockchain(blockchain_path=None):
+    """
+    Read the IPFS CID of the global model from blockchain.txt.
+
+    blockchain.txt is expected to contain a line like:
+        Global mode=<CID>
+    Returns the CID string, or None if not found / file missing.
+    """
+    if blockchain_path is None:
+        blockchain_path = os.path.join(os.path.dirname(__file__), "blockchain.txt")
+
+    if not os.path.exists(blockchain_path):
+        print(f"⚠️  blockchain.txt not found at {blockchain_path}")
+        return None, blockchain_path
+
+    with open(blockchain_path, "r") as f:
+        content = f.read().strip()
+
+    # Support two formats:
+    #  1.  "Global mode=<CID>"  (written by main.py / server)
+    #  2.  Bare CID on its own line
+    cid = None
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("Global mode="):
+            cid = line.split("=", 1)[1].strip()
+            break
+        # Also accept a bare 46-char CIDv0 (Qm…) or CIDv1
+        if line.startswith("Qm") or line.startswith("bafy"):
+            cid = line
+            break
+
+    if cid:
+        print(f"\n🔗 Found IPFS CID in blockchain.txt: {cid}")
+    else:
+        print("⚠️  Could not parse an IPFS CID from blockchain.txt")
+
+    return cid, blockchain_path
+
+
+def download_model_from_ipfs(cid, save_path):
+    """
+    Download the model JSON identified by *cid* from IPFS and save it to
+    *save_path*.  Tries multiple public gateways in sequence.
+
+    Returns True on success, False on failure.
+    """
+    if requests is None:
+        print("⚠️  'requests' package not installed – cannot download from IPFS.")
+        return False
+
+    for gateway_tpl in IPFS_GATEWAYS:
+        url = gateway_tpl.format(cid=cid)
+        print(f"   Trying gateway: {url}")
+        try:
+            resp = requests.get(url, timeout=60)
+            if resp.status_code == 200:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                with open(save_path, "wb") as fh:
+                    fh.write(resp.content)
+                print(f"✅ Model downloaded from IPFS → {save_path}")
+                return True
+            else:
+                print(f"   ✗ HTTP {resp.status_code}")
+        except Exception as exc:
+            print(f"   ✗ Error: {exc}")
+
+    print("❌ All IPFS gateways failed.")
+    return False
+
+
 def load_global_model(model_folder="model"):
     """
-    Load the global model from the server.
+    Load the global model.
 
-    In true federated learning, clients receive the global model from the server
-    at the beginning of each round.
+    Strategy (in order):
+      1. Read the IPFS CID from blockchain.txt and download the model.
+      2. Fall back to locally cached model files.
     """
     print("=" * 70)
     print("🔐 FEDERATED LEARNING CLIENT")
     print("=" * 70)
 
-    # Priority order for model loading
+    # ── Step 1: try to get the model from IPFS via blockchain.txt ─────────────
+    cid, blockchain_path = read_ipfs_hash_from_blockchain()
+    ipfs_model_path = os.path.join(model_folder, "global_model_ipfs.json")
+
+    if cid:
+        print("\n📡 Downloading global model from IPFS...")
+        success = download_model_from_ipfs(cid, ipfs_model_path)
+        if success:
+            print(f"\n📂 Loading model from IPFS download: {ipfs_model_path}")
+            model = xgb.XGBClassifier()
+            model.load_model(ipfs_model_path)
+            print("✅ Global model loaded successfully from IPFS!")
+            return model, ipfs_model_path
+        else:
+            print("⚠️  IPFS download failed – falling back to local model files.")
+
+    # ── Step 2: fall back to local files ──────────────────────────────────────
     possible_models = [
-        "global_model.json",  # Latest global model from server
-        "Central_model.json",  # Initial central model
-        "client_updated_model.json",  # Previous client model
+        "global_model.json",
+        "Central_model.json",
+        "client_updated_model.json",
     ]
 
     model_path = None
@@ -57,14 +164,14 @@ def load_global_model(model_folder="model"):
 
     if model_path is None:
         raise FileNotFoundError(
-            f"No global model found in '{model_folder}' folder.\n"
-            "Run the server aggregation first or train a central model."
+            f"No global model found in '{model_folder}' folder and IPFS download failed.\n"
+            "Ensure blockchain.txt contains a valid IPFS CID or provide a local model."
         )
 
-    print(f"\n📂 Loading global model from {model_path}...")
+    print(f"\n📂 Loading global model from local file: {model_path}")
     model = xgb.XGBClassifier()
     model.load_model(model_path)
-    print("✅ Global model loaded successfully!")
+    print("✅ Global model loaded successfully from local file!")
 
     return model, model_path
 
@@ -335,6 +442,229 @@ def save_client_outputs(model, histogram_data, client_id, output_folder="model")
     return histograms_path, local_model_path
 
 
+def upload_to_ipfs_and_log_blockchain(
+    histogram_data,
+    client_id,
+    accuracy=None,
+    blockchain_path=None,
+):
+    """
+    Upload client training details (histogram metadata) to IPFS via Pinata
+    and append the CID to blockchain.txt.
+
+    Returns:
+        str | None: The IPFS CID on success, or None on failure.
+    """
+    if requests is None:
+        print("⚠️  'requests' package not installed – skipping IPFS upload.")
+        return None
+
+    if blockchain_path is None:
+        blockchain_path = os.path.join(os.path.dirname(__file__), "blockchain.txt")
+
+    PINATA_API_KEY = os.getenv("PINATA_API_KEY")
+    PINATA_SECRET_API_KEY = os.getenv("PINATA_SECRET_API_KEY")
+
+    if not PINATA_API_KEY or not PINATA_SECRET_API_KEY:
+        print(
+            "⚠️  PINATA_API_KEY / PINATA_SECRET_API_KEY not set in .env – "
+            "skipping histogram IPFS upload."
+        )
+        return None
+
+    training_record = {
+        "client_id": client_id,
+        "round_id": histogram_data.get("round_id", 1),
+        "timestamp": datetime.now().isoformat(),
+        "num_samples": histogram_data.get("num_samples", 0),
+        "num_features": histogram_data.get("num_features", 0),
+        "num_classes": histogram_data.get("num_classes", 0),
+        "label_distribution": histogram_data.get("label_distribution", {}),
+        "histogram_hash": histogram_data.get("histogram_hash", ""),
+        "local_accuracy": accuracy,
+        "framework": "XGBoost-FedAvg",
+    }
+
+    print("\n" + "=" * 70)
+    print("🔗 IPFS UPLOAD – CLIENT TRAINING RECORD")
+    print("=" * 70)
+    print(f"   Client      : {client_id}")
+    print(f"   Samples     : {training_record['num_samples']}")
+    print(f"   Hist hash   : {training_record['histogram_hash']}")
+    if accuracy is not None:
+        print(f"   Accuracy    : {accuracy:.4f}")
+
+    ipfs_hash = None
+    temp_file_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix=f"{client_id}_training_"
+        ) as tmp:
+            json.dump(training_record, tmp, indent=2)
+            temp_file_path = tmp.name
+
+        url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
+        headers = {
+            "pinata_api_key": PINATA_API_KEY,
+            "pinata_secret_api_key": PINATA_SECRET_API_KEY,
+        }
+        pinata_metadata = {
+            "name": f"{client_id}_round{training_record['round_id']}_training_record"
+        }
+
+        print("\n📤 Uploading training record to IPFS via Pinata...")
+        with open(temp_file_path, "rb") as fh:
+            response = requests.post(
+                url,
+                files={"file": fh},
+                data={"pinataMetadata": json.dumps(pinata_metadata)},
+                headers=headers,
+                timeout=60,
+            )
+
+        if response.status_code == 200:
+            ipfs_hash = response.json()["IpfsHash"]
+            print(f"✅ Uploaded to IPFS – CID: {ipfs_hash}")
+            print(f"   🌐 https://gateway.pinata.cloud/ipfs/{ipfs_hash}")
+        else:
+            print(f"❌ Pinata upload failed: {response.status_code} – {response.text}")
+            return None
+
+    except Exception as exc:
+        print(f"❌ Error during IPFS upload: {exc}")
+        return None
+
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+
+    # Append entry to blockchain.txt
+    try:
+        entry = (
+            f"{training_record['timestamp']} | "
+            f"client={client_id} | "
+            f"round={training_record['round_id']} | "
+            f"samples={training_record['num_samples']} | "
+            f"hist_hash={training_record['histogram_hash']} | "
+            f"accuracy={accuracy if accuracy is not None else 'N/A'} | "
+            f"ipfs_cid={ipfs_hash}\n"
+        )
+        with open(blockchain_path, "a") as bf:
+            bf.write(entry)
+        print(f"📝 Entry appended to blockchain.txt: {blockchain_path}")
+        print(f"   {entry.strip()}")
+    except Exception as exc:
+        print(f"⚠️  Could not write to blockchain.txt: {exc}")
+
+    print("=" * 70)
+    return ipfs_hash
+
+
+def upload_updated_model_to_ipfs(
+    model, client_id, model_folder="model", blockchain_path=None
+):
+    """
+    Save the locally-trained model to a file, upload it to IPFS via Pinata,
+    and OVERWRITE blockchain.txt with the new CID in the same format as main.py:
+
+        Global mode=<new_CID>
+
+    This makes the updated model available for the next federated round.
+
+    Args:
+        model: Trained XGBClassifier instance.
+        client_id (str): Client identifier (used for the Pinata pin name).
+        model_folder (str): Folder to temporarily save the model JSON.
+        blockchain_path (str | None): Path to blockchain.txt.
+
+    Returns:
+        str | None: The new IPFS CID on success, or None on failure.
+    """
+    if requests is None:
+        print("⚠️  'requests' package not installed – skipping updated-model upload.")
+        return None
+
+    if blockchain_path is None:
+        blockchain_path = os.path.join(os.path.dirname(__file__), "blockchain.txt")
+
+    PINATA_API_KEY = os.getenv("PINATA_API_KEY")
+    PINATA_SECRET_API_KEY = os.getenv("PINATA_SECRET_API_KEY")
+
+    if not PINATA_API_KEY or not PINATA_SECRET_API_KEY:
+        print(
+            "⚠️  PINATA_API_KEY / PINATA_SECRET_API_KEY not set in .env – "
+            "skipping updated-model upload."
+        )
+        return None
+
+    print("\n" + "=" * 70)
+    print("🚀 UPLOADING UPDATED MODEL TO IPFS")
+    print("=" * 70)
+
+    # Save model to a temporary file
+    os.makedirs(model_folder, exist_ok=True)
+    temp_model_path = os.path.join(model_folder, f"{client_id}_updated_model_tmp.json")
+    try:
+        model.save_model(temp_model_path)
+        print(f"💾 Model saved temporarily to: {temp_model_path}")
+    except Exception as exc:
+        print(f"❌ Could not save model: {exc}")
+        return None
+
+    new_cid = None
+    try:
+        url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
+        headers = {
+            "pinata_api_key": PINATA_API_KEY,
+            "pinata_secret_api_key": PINATA_SECRET_API_KEY,
+        }
+        pinata_metadata = {
+            "name": f"{client_id}_updated_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        }
+
+        print("📤 Uploading updated model to IPFS via Pinata...")
+        with open(temp_model_path, "rb") as fh:
+            response = requests.post(
+                url,
+                files={"file": fh},
+                data={"pinataMetadata": json.dumps(pinata_metadata)},
+                headers=headers,
+                timeout=120,
+            )
+
+        if response.status_code == 200:
+            new_cid = response.json()["IpfsHash"]
+            print(f"✅ Updated model uploaded to IPFS – CID: {new_cid}")
+            print(f"   🌐 https://gateway.pinata.cloud/ipfs/{new_cid}")
+        else:
+            print(f"❌ Pinata upload failed: {response.status_code} – {response.text}")
+            return None
+
+    except Exception as exc:
+        print(f"❌ Error uploading updated model: {exc}")
+        return None
+
+    finally:
+        # Clean up temporary model file
+        if os.path.exists(temp_model_path):
+            os.unlink(temp_model_path)
+
+    # ── Overwrite blockchain.txt with the new global model CID ────────────────
+    try:
+        new_entry = f"Global mode={new_cid}"
+        with open(blockchain_path, "w") as bf:
+            bf.write(new_entry)
+        print("\n📝 blockchain.txt updated with new model CID:")
+        print(f"   {new_entry}")
+        print(f"   Path: {blockchain_path}")
+    except Exception as exc:
+        print(f"⚠️  Could not update blockchain.txt: {exc}")
+
+    print("=" * 70)
+    return new_cid
+
+
 def main():
     """
     Main federated learning client workflow.
@@ -366,22 +696,45 @@ def main():
         probs_precomputed=probs_precomputed,
     )
 
-    # Save outputs
-    hist_path, model_path = save_client_outputs(
+    # Save outputs (histograms sent to server)
+    hist_path, local_model_path = save_client_outputs(
         model, histogram_data, client_id, output_folder="model"
+    )
+
+    # Upload training details (histogram metadata) to IPFS and log to blockchain.txt
+    hist_ipfs_cid = upload_to_ipfs_and_log_blockchain(
+        histogram_data=histogram_data,
+        client_id=client_id,
+        accuracy=None,  # Pass a float here if you compute local accuracy
+    )
+
+    # ── KEY STEP: Upload the updated (locally-trained) model to IPFS ──────────
+    # After uploading, blockchain.txt is overwritten with the new model CID so
+    # that the next federated round starts from this updated model.
+    new_model_cid = upload_updated_model_to_ipfs(
+        model=model,
+        client_id=client_id,
+        model_folder="model",
     )
 
     # Summary
     print("\n" + "=" * 70)
     print("✅ FEDERATED LEARNING CLIENT COMPLETE")
     print("=" * 70)
-    print(f"Client: {client_id}")
-    print(f"Samples trained: {histogram_data['num_samples']}")
-    print(f"Histograms: {hist_path}")
+    print(f"Client          : {client_id}")
+    print(f"Samples trained : {histogram_data['num_samples']}")
+    print(f"Histograms file : {hist_path}")
+    if hist_ipfs_cid:
+        print(f"Histogram CID   : {hist_ipfs_cid}")
+    if new_model_cid:
+        print(f"Updated model CID: {new_model_cid}")
+        print("blockchain.txt  : updated with new model CID ✅")
     print("\nNext steps:")
     print("1. Send histograms to aggregation server")
     print("2. Server will aggregate from all clients")
-    print("3. Receive updated global model for next round")
+    print(
+        "3. Next client run will fetch the updated model from IPFS via blockchain.txt"
+    )
     print("=" * 70)
 
 

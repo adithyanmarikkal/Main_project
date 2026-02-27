@@ -8,6 +8,12 @@ import pandas as pd
 import numpy as np
 import os
 import glob
+import tempfile
+import requests
+from dotenv import load_dotenv
+
+# Load environment variables from .env file in server directory
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 # 0. Load data from folder
 print("📂 Loading data from folder...")
@@ -66,5 +72,48 @@ print(f"\n✅ XGBoost Accuracy: {accuracy_score(y_test, y_pred_xgb):.4f}")
 used_labels = np.unique(y_encoded)
 used_names = le.inverse_transform(used_labels)
 
-# 10. Save the XGBoost model
-xgb_model.save_model(os.path.join("Central_model.json"))
+# 10. Upload the XGBoost model to IPFS using Pinata
+print("📤 Uploading model to IPFS...")
+
+# Get Pinata API credentials
+PINATA_API_KEY = os.getenv('PINATA_API_KEY')
+PINATA_SECRET_API_KEY = os.getenv('PINATA_SECRET_API_KEY')
+
+if not PINATA_API_KEY or not PINATA_SECRET_API_KEY:
+    raise ValueError("PINATA_API_KEY and PINATA_SECRET_API_KEY must be set in .env file")
+
+# Save model to temporary file
+with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
+    xgb_model.save_model(temp_file.name)
+    temp_file_path = temp_file.name
+
+# Upload to Pinata
+url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
+headers = {
+    'pinata_api_key': PINATA_API_KEY,
+    'pinata_secret_api_key': PINATA_SECRET_API_KEY
+}
+
+try:
+    with open(temp_file_path, 'rb') as file:
+        files = {'file': file}
+        response = requests.post(url, files=files, headers=headers)
+        
+    if response.status_code == 200:
+        ipfs_hash = "Global mode=" + response.json()['IpfsHash']
+        print(f"✅ Model uploaded to IPFS with hash: {ipfs_hash}")
+        
+        # Store hash in blockchain.txt
+        with open('blockchain.txt', 'w') as f:
+            f.write(ipfs_hash)
+        print("📝 IPFS hash saved to blockchain.txt")
+    else:
+        print(f"❌ Error uploading to IPFS: {response.status_code} - {response.text}")
+        
+except Exception as e:
+    print(f"❌ Error during upload: {str(e)}")
+    
+finally:
+    # Clean up temporary file
+    if os.path.exists(temp_file_path):
+        os.unlink(temp_file_path)
